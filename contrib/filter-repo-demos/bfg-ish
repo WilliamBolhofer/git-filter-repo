@@ -96,6 +96,7 @@ near the top of git-filter-repo.
 import argparse
 import fnmatch
 import os
+import sys
 import re
 import subprocess
 import tempfile
@@ -143,6 +144,8 @@ class BFG_ish:
             help=("delete folders with the specified names (e.g. '.svn', '*-tmp' - matches on folder name, not path within repo)"))
     parser.add_argument('--replace-text', '-rt', metavar='<expressions-file>',
             help=("filter content of files, replacing matched text. Match expressions should be listed in the file, one expression per line - by default, each expression is treated as a literal, but 'regex:' & 'glob:' prefixes are supported, with '==>' to specify a replacement string other than the default of '***REMOVED***'."))
+    parser.add_argument('--git-unfat', '-gu', metavar='<git-fat-stor-dir>',
+            help=("replace all git-fat file references with the actual binary file blob. The argument is the location of the fat file storage, i.e. the directory with all the git-fat blobs in it"))
     parser.add_argument('--filter-content-including', '-fi', metavar='<glob>',
                         type=os.fsencode,
             help=("do file-content filtering on files that match the specified expression (eg '*.{txt,properties}')"))
@@ -220,6 +223,69 @@ class BFG_ish:
 
     return True
 
+  def git_unfat_blobs(self, commit):
+      for change in commit.file_changes:
+          if change.type == b'D':
+              continue # deleted files have no remaining content to filter
+
+          if change.mode in (b'120000', b'160000'):
+              continue # symlinks and submodules aren't text files we can filter
+
+          if change.blob_id in self.filtered_blobs:
+              change.blob_id = self.filtered_blobs[change.blob_id]
+              continue
+
+          if not self.should_filter_path(change.filename):
+              continue
+
+          self.cat_file_proc.stdin.write(change.blob_id + b'\n')
+          self.cat_file_proc.stdin.flush()
+          objhash, objtype, objsize = self.cat_file_proc.stdout.readline().split()
+          # FIXME: This next line assumes the file fits in memory; though the way
+          # fr.Blob works we kind of have that assumption baked in elsewhere too...
+          contents = self.cat_file_proc.stdout.read(int(objsize))
+
+          try:
+              # If the contents are not utf-8, this can't be a git-fat file ref
+              contents.decode("utf-8")
+
+              # If the blob size is out of range (git-fat file refs seem to be 107)
+              # then raise an exception and move on. Regex compares are expensive
+              # in terms of CPU usage and time, so don't waste time on files we
+              # know can't be fat file refs
+              blob_size = sys.getsizeof(contents)
+              if blob_size < 100 or blob_size > 120:
+                  raise Exception
+          except Exception:
+              fat_file_contents = contents
+          else:
+              # Look for git-fat file ref pointers
+              fat_match = re.search(r"git\-fat ([0-9a-f]{40})", contents.decode("utf-8"))
+              if fat_match:
+                  # The sha-1 in the fat file ref is the name of the binary file in the fat storage area
+                  fat_file_name = fat_match.group(1)
+                  print("\nINFO: " + str(change.filename.decode("utf-8")) + " => " + fat_file_name)
+                  fat_file_path = self.gitfat_stor + "/" + fat_file_name
+                  if os.path.exists(fat_file_path):
+                      # Replace the contents of the blob with the actual binary file
+                      with open(fat_file_path, mode="rb") as fat_fh:
+                          fat_file_contents = fat_fh.read()
+                  else:
+                      print("ERROR: You have a problem, file does not exist: " + fat_file_path)
+                      print("ERROR: Skipping...")
+                      fat_file_contents = contents
+
+              else:
+                  fat_file_contents = contents
+          finally:
+              self.cat_file_proc.stdout.read(1) # Read trailing newline
+
+              # Update the blob object
+              blob = fr.Blob(fat_file_contents)
+              self.filter.insert(blob)
+              self.filtered_blobs[change.blob_id] = blob.id
+              change.blob_id = blob.id
+
   def filter_relevant_blobs(self, commit):
     for change in commit.file_changes:
       if change.type == b'D':
@@ -284,6 +350,10 @@ class BFG_ish:
     # Filter text of relevant files
     if self.replacement_rules:
       self.filter_relevant_blobs(commit)
+
+    # Replace all git-fat ref files with the actual binary file
+    if self.gitfat_stor:
+      self.git_unfat_blobs(commit)
 
     # Replace commit hashes in commit message with 'newhash [formerly oldhash]'
     if self.args.use_formerly_log_text:
@@ -396,6 +466,14 @@ class BFG_ish:
       new_replace_file = self.convert_replace_text(bfg_args.replace_text)
       rules = fr.FilteringOptions.get_replace_text(new_replace_file)
       self.replacement_rules = rules
+      self.cat_file_proc = subprocess.Popen(['git', 'cat-file', '--batch'],
+                                            stdin = subprocess.PIPE,
+                                            stdout = subprocess.PIPE)
+    if bfg_args.git_unfat:
+      if os.path.exists(bfg_args.git_unfat) and os.path.isdir(bfg_args.git_unfat):
+          self.gitfat_stor = os.path.abspath(bfg_args.git_unfat)
+      else:
+          raise Exception("ERROR: Path to git-fat storage directory is invalid: " + git_unfat)
       self.cat_file_proc = subprocess.Popen(['git', 'cat-file', '--batch'],
                                             stdin = subprocess.PIPE,
                                             stdout = subprocess.PIPE)
