@@ -145,7 +145,9 @@ class BFG_ish:
     parser.add_argument('--replace-text', '-rt', metavar='<expressions-file>',
             help=("filter content of files, replacing matched text. Match expressions should be listed in the file, one expression per line - by default, each expression is treated as a literal, but 'regex:' & 'glob:' prefixes are supported, with '==>' to specify a replacement string other than the default of '***REMOVED***'."))
     parser.add_argument('--git-unfat', '-gu', metavar='<git-fat-stor-dir>',
-            help=("replace all git-fat file references with the actual binary file blob. The argument is the location of the fat file storage, i.e. the directory with all the git-fat blobs in it"))
+            help=("replace all git-fat file references with the actual binary file blob. The argument is the location of the fat file storage, i.e. the directory with all the git-fat blobs in it.  Can be combined with the --git-attributes-file option to make sure there are no hooks to git-fat left."))
+    parser.add_argument('--git-attributes-file', '-gf', metavar='<new-git-attributes-file>',
+            help=("replace the .gitattributes file with the provided file.  Useful when used with --git-unfat."))
     parser.add_argument('--filter-content-including', '-fi', metavar='<glob>',
                         type=os.fsencode,
             help=("do file-content filtering on files that match the specified expression (eg '*.{txt,properties}')"))
@@ -254,7 +256,7 @@ class BFG_ish:
               # in terms of CPU usage and time, so don't waste time on files we
               # know can't be fat file refs
               blob_size = sys.getsizeof(contents)
-              if blob_size < 100 or blob_size > 120:
+              if (blob_size < 100 or blob_size > 120) and (change.filename.decode("utf-8") != ".gitattributes"):
                   raise Exception
           except Exception:
               fat_file_contents = contents
@@ -273,6 +275,14 @@ class BFG_ish:
                   else:
                       print("ERROR: You have a problem, file does not exist: " + fat_file_path)
                       print("ERROR: Skipping...")
+                      fat_file_contents = contents
+
+              elif change.filename.decode("utf-8") == ".gitattributes":
+                  if (self.git_attributes_file != None):
+                      with open(self.git_attributes_file, mode="rb") as attr_fh:
+                          fat_file_contents = attr_fh.read()
+                      print("\nINFO: " + str(change.filename.decode("utf-8")) + " Modified.")
+                  else:
                       fat_file_contents = contents
 
               else:
@@ -474,6 +484,14 @@ class BFG_ish:
           self.gitfat_stor = os.path.abspath(bfg_args.git_unfat)
       else:
           raise Exception("ERROR: Path to git-fat storage directory is invalid: " + git_unfat)
+
+      self.git_attributes_file = None
+      if bfg_args.git_attributes_file:
+          if os.path.exists(bfg_args.git_attributes_file) and os.path.isfile(bfg_args.git_attributes_file):
+              self.git_attributes_file = os.path.abspath(bfg_args.git_attributes_file)
+          else:
+              raise Exception("ERROR: Specified path to new .gitattributes file is invalid: " + git_attributes_file)
+
       self.cat_file_proc = subprocess.Popen(['git', 'cat-file', '--batch'],
                                             stdin = subprocess.PIPE,
                                             stdout = subprocess.PIPE)
